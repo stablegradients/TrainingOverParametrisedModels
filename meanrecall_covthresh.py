@@ -3,6 +3,26 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.utils.tensorboard import SummaryWriter
 
+import matplotlib.pyplot as plt
+import numpy as np
+import random
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+from sklearn.metrics import confusion_matrix
+import numpy as np
+
+
+from tqdm import tqdm
+import copy
+
+from torchvision.models.resnet import _resnet
+
+import models
+from sklearn.metrics import precision_score, recall_score, accuracy_score, f1_score
+
+
 def sample(dataset="cifar10"):
     '''
     Returns dataloader and dataset for the trainset and testset respectively
@@ -47,11 +67,6 @@ def sample(dataset="cifar10"):
         testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
                                                 shuffle=False, num_workers=8)
     return trainloader, trainset, testloader, testset
-
-
-import matplotlib.pyplot as plt
-import numpy as np
-import random
 
 
 def show_data_distribution(dataset, keyname="no name"):
@@ -104,6 +119,7 @@ def subsample(dataset, lamda=1, class_indices=None):
     dataset.targets=list(dataset.targets[x] for x in select_list)
     return dataset, prior, class_indices
 
+
 def long_tail_test():
     trainloader, trainset, testloader, testset = sample()
     imbalanced_trainset, prior, indices = subsample(trainset, lamda = 0.7, class_indices=list(range(10)))
@@ -132,23 +148,38 @@ def long_tail_test():
     return
 
 
-import torch.nn as nn
-import torch.nn.functional as F
+def gain_matrix(lamdas, CM, prior, lr=0.01):
+    new_lamdas = []
+    C = np.sum(CM, axis=0).tolist()
+    for i, (l, c, p) in enumerate(zip(lamdas, C, prior)):
+        l_ = l - lr * (c - 0.095)
+        l_ = max(0, l_)
+        new_lamdas.append(l_)
+    G = np.zeros((10,10))
+    D = np.zeros((10,10))
+    for i in range(10):
+        for j in range(10):
+            if i==j:
+                G[i, i] = 0.1/prior[i] + new_lamdas[j]
+                D[i, i] = 0.1/prior[i] + new_lamdas[j]
+            else:
+                G[i, j] = new_lamdas[j]
+    M = np.matmul(G, np.linalg.inv(D))
+    return M, D, new_lamdas
 
-class LALoss(nn.Module):
-    def __init__(self, gain_matrix=np.eye(10)/10, device='cuda:3'):
-        super(LALoss, self).__init__()
+class CSLLoss(nn.Module):
+    def __init__(self, M, D, device='cuda:0'):
+        super(CSLLoss, self).__init__()
         self.device = torch.device(device)
-        self.adjustment = torch.log( 1 + torch.tensor(np.diag(gain_matrix)).to(self.device))
-        self.adjustment.requires_grad = False
+        self.M = torch.tensor(M)
+        self.D = torch.tensor(np.diag(D))
+        self.adjustment = torch.log(self.D.to(torch.device(self.device)))
     def forward(self, inputs, targets):
-        inputs = inputs - self.adjustment
-        return F.cross_entropy(inputs, targets)
+        log_probs = F.log_softmax(inputs - self.adjustment , dim=1)
+        weights = self.M[targets.cpu()].to(torch.device(self.device))
+        product = weights * log_probs
+        return -1 * torch.mean(torch.sum(product, 1))
 
-import models
-
-
-from sklearn.metrics import precision_score, recall_score, accuracy_score, f1_score
 
 def get_metrics(outputs, labels, classes):
     '''
@@ -206,9 +237,9 @@ def get_metrics(outputs, labels, classes):
         metrics["precision_" + name] = precision[i]
         metrics["recall_" + name] = recall[i]
 
-    return metrics, recall
+    return metrics
 
-def train(trainloader, optimizer, net, criterion, epoch, device=torch.device('cuda:3'), max_steps=50):
+def train(trainloader, optimizer, net, criterion, epoch, device=torch.device('cuda:0'), max_steps=50):
     '''
     TODO 
     '''
@@ -248,31 +279,27 @@ def train(trainloader, optimizer, net, criterion, epoch, device=torch.device('cu
             return running_loss
     return running_loss
 
-def test(testloader, net, device=torch.device('cuda:3')):
+def test(testloader, net, device=torch.device('cuda:0')):
     '''
     TODO
     '''
     net.eval()
     output_logs, label_logs = [], []
+    with torch.no_grad():
+        for i, data in enumerate(testloader, 0):
+            # get the inputs; data is a list of [inputs, labels]
+            inputs, labels = data
+            if torch.cuda.is_available():
+                inputs, labels = inputs.to(device), labels.to(device)
+            else:
+                pass
+            labels = labels.cpu().detach().numpy()
+            outputs = torch.argmax(net(inputs), dim=1).cpu().detach().numpy()
+            output_logs.append(outputs)
+            label_logs.append(labels)
+        return (np.concatenate(output_logs, axis=0), np.concatenate(label_logs, axis=0))
 
-    for i, data in enumerate(testloader, 0):
-        # get the inputs; data is a list of [inputs, labels]
-        inputs, labels = data
-        if torch.cuda.is_available():
-            inputs, labels = inputs.to(device), labels.to(device)
-        else:
-            pass
-        labels = labels.cpu().detach().numpy()
-        outputs = torch.argmax(net(inputs), dim=1).cpu().detach().numpy()
-        output_logs.append(outputs)
-        label_logs.append(labels)
-    return (np.concatenate(output_logs, axis=0), np.concatenate(label_logs, axis=0))
-
-
-from sklearn.metrics import confusion_matrix
-import numpy as np
-
-def validation(valloader, net, lamda, prior, classes, lr=0.1, device='cuda:3'):
+def validation(valloader, net, lamdas, prior, classes, lr=0.1, device='cuda:0'):
     '''
     Args:
         valloader: a torch dataloader
@@ -283,56 +310,40 @@ def validation(valloader, net, lamda, prior, classes, lr=0.1, device='cuda:3'):
     Returns:
         the gain matrix and lamda
     '''
-    # print("")
-    # print("lamda:", [round(x,4) for x in lamda])
-    # print("prior", [round(x,4) for x in  prior])
     net.eval()
     outputs, labels = test(valloader, net)
-    metrics, recall = get_metrics(outputs, labels, classes)
-    CM = confusion_matrix(labels, outputs, normalize="all")
-    # diagonal = CM.diagonal().tolist()
-    # print("diagonal", [round(x,4) for x in diagonal])
-    lamda_ = [x * np.exp(-1 * lr * r) for x, r in zip(lamda, recall.tolist())]
-    lamda_normalise  = sum(lamda)
-    # print(lamda_normalise)
-    new_lamda = [x / lamda_normalise for x in lamda_]
-    # print("new lamdas ", [round(x,4) for x in new_lamda])
-    diagonal = [x/p for x,p in zip(new_lamda, prior)]
-    return np.diag(diagonal), new_lamda, CM
-
-from tqdm import tqdm
-import copy
-
-
+    CM = confusion_matrix(labels, outputs, normalize='all')
+    M, D, new_lamdas = gain_matrix(lamdas, CM, prior, lr)
+    return M, D, new_lamdas, CM
 
 def loop(writer, trainloader, testloader, valloader, classes, net, optimizer, prior, lamda, epochs=1200, lr_scheduler=None, max_steps=50):
     logbar = tqdm(range(0, epochs), total=epochs, leave=False)
     max_acc = 0.0
     best_acc_model = None
-    
+
     for i in logbar:
-        G, lamda, CM = validation(valloader, net, lamda, prior, classes, lr=0.1)
-        criterion = LALoss(gain_matrix=G)
+        M, D, lamda, CM = validation(valloader, net, lamda, prior, classes, lr=0.1)
+        criterion = CSLLoss(M, D)
         train_loss = train(trainloader, optimizer, net, criterion, epoch=i, max_steps=max_steps)
         lr_scheduler.step()
         writer.add_scalar("train/loss", train_loss, i)
 
         outputs, labels = test(testloader, net)
-        metrics, _ = get_metrics(outputs, labels, classes)
+        metrics = get_metrics(outputs, labels, classes)
+        
+        CM = confusion_matrix(labels, outputs, normalize='all')
+        C = np.sum(CM, axis=0).tolist()
         for key in metrics.keys():
             writer.add_scalar("test/" + key, metrics[key], i)
         for j in range(10):
             writer.add_scalar("val/lambda - " + str(j + 1), lamda[j], i)
+
+        for j, (c, p) in enumerate(zip(C, prior)):
+            writer.add_scalar("test/coverage - " + str(j + 1), c, i)
+        min_cov = np.min(np.sum(CM, axis=0))
+        writer.add_scalar("test/min_coverage - " , min_cov, i)
         logbar.set_description(f"Epoch [{i}/{epochs}")
 
-        cm_diag = np.diag(CM).tolist()
-
-        for j in range(10):
-            writer.add_scalar("val/cm-diagonalBYprior - " + str(j + 1), cm_diag[j]/prior[j], i)
-        
-        for j in range(10):
-            writer.add_scalar("val/cm-diagonal - " + str(j + 1), cm_diag[j], i)
-        
         logbar.set_description(f"Epoch [{i}/{epochs}")
         acc = "accuracy"
         logbar.set_postfix(train_loss=f"{train_loss:.2f}", val_acc=f"{metrics[acc]:.2f}")
@@ -343,9 +354,9 @@ def loop(writer, trainloader, testloader, valloader, classes, net, optimizer, pr
 import random
 
 
-def split(dataset):
+def split(dataset, ratio=0.5):
     dataset_len = len(dataset)
-    splits = int(0.2 * dataset_len )
+    splits = int(ratio * dataset_len )
     indices = list(range(dataset_len))
     random.shuffle(indices)
     
@@ -360,21 +371,21 @@ def split(dataset):
     return valset, trainset
 
 
-import torchvision.transforms as transforms
+import torchvision.transforms as transforms 
 
 import PIL
 
-from torchvision.models.resnet import _resnet
+from torchvision.models.resnet import *
 import torchvision
 
 
-
 for lamda in [0.6]:
-    writer = SummaryWriter(log_dir="./logs/trash/resnet56+/")
-    batch_size = 128
+    writer = SummaryWriter(log_dir="./logs/resnet56/meanrecall@coveragethresh-0d95/90steps-64bs-(600,900,1100)lr-gamma-0d01lr")
+    batch_size = 64
     trainloader, trainset, testloader, testset = sample()
     trainset, train_prior, indices = subsample(trainset, lamda, class_indices=list(range(len(trainset.classes))))
-    valset, trainset = split(trainset)
+    valset, testset = split(testset, 0.5)
+    
     testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
                                              shuffle=False, num_workers=8)
     trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size,
@@ -389,20 +400,10 @@ for lamda in [0.6]:
    # get some random training images
     dataiter = iter(trainloader)
     images, labels = dataiter.next()
-    device = torch.device('cuda:3')
+    device = torch.device('cuda:0')
     net = models.resnet32(num_classes=10).to(device)
-    optimizer = torch.optim.SGD(net.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4, nesterov=True)
+    optimizer = torch.optim.SGD(net.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-3, nesterov=True)
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                        milestones=[600, 900, 1000], gamma = 0.1)
-    # lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.98)
-    def runif_in_simplex(n):
-        ''' Return uniformly random vector in the n-simplex '''
-
-        k = np.random.randint(100, size=10)
-        l = k / sum(k)
-        l = l.tolist()
-        random.shuffle(l)
-        return l
-    best_net = loop(writer, trainloader, testloader, valloader, trainset.classes ,net, optimizer, train_prior, [0.1]*10 , 1200, lr_scheduler, max_steps=50)
-    torch.save(best_net.state_dict(), "./logs/trash/resnet56+/run1.pth")
-
+                                                        milestones=[600, 900, 1100], gamma = 0.1)
+    best_net = loop(writer, trainloader, testloader, valloader, trainset.classes ,net, optimizer, train_prior, [0.1]*10 , 1200, lr_scheduler, max_steps=90)
+    torch.save(best_net.state_dict(), "./logs/resnet56/meanrecall@coveragethresh-0d95/90steps-64bs-(600,900,1100)lr-gamma-0d01lr.pth")

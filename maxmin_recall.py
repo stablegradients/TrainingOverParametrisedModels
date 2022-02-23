@@ -141,9 +141,9 @@ class LALoss(nn.Module):
         self.device = torch.device(device)
         self.adjustment = torch.log(torch.tensor(np.diag(gain_matrix)).to(self.device))
         self.adjustment.requires_grad = False
-    def forward(self, inputs, targets):
+    def forward(self, inputs, targets, reduction='mean'):
         inputs = inputs - self.adjustment
-        return F.cross_entropy(inputs, targets)
+        return F.cross_entropy(inputs, targets, reduction=reduction)
 
 import models
 
@@ -283,20 +283,14 @@ def validation(valloader, net, lamda, prior, classes, lr=0.1, device='cuda:3'):
     Returns:
         the gain matrix and lamda
     '''
-    # print("")
-    # print("lamda:", [round(x,4) for x in lamda])
-    # print("prior", [round(x,4) for x in  prior])
     net.eval()
     outputs, labels = test(valloader, net)
     metrics, recall = get_metrics(outputs, labels, classes)
     CM = confusion_matrix(labels, outputs, normalize="all")
-    # diagonal = CM.diagonal().tolist()
-    # print("diagonal", [round(x,4) for x in diagonal])
+    print(CM)
     lamda_ = [x * np.exp(-1 * lr * r) for x, r in zip(lamda, recall.tolist())]
     lamda_normalise  = sum(lamda)
-    # print(lamda_normalise)
     new_lamda = [x / lamda_normalise for x in lamda_]
-    # print("new lamdas ", [round(x,4) for x in new_lamda])
     diagonal = [x/p for x,p in zip(new_lamda, prior)]
     return np.diag(diagonal), new_lamda, CM
 
@@ -311,7 +305,11 @@ def loop(writer, trainloader, testloader, valloader, classes, net, optimizer, pr
     best_acc_model = None
     
     for i in logbar:
-        G, lamda, CM = validation(valloader, net, lamda, prior, classes, lr=0.1)
+        if i<=600:
+            lr = 0.1*2.71**(0.00765 * (i-600))
+        else:
+            lr = 0.1*2.71**(0.00765 * (600-i))
+        G, lamda, CM = validation(valloader, net, lamda, prior, classes, lr=lr)
         criterion = LALoss(gain_matrix=G)
         train_loss = train(trainloader, optimizer, net, criterion, epoch=i, max_steps=max_steps)
         lr_scheduler.step()
@@ -370,17 +368,17 @@ import torchvision
 
 
 for lamda in [0.6]:
-    writer = SummaryWriter(log_dir="./logs/resnet56/lr-0.1_gamma-0.98_50steps")
+    writer = SummaryWriter(log_dir="./test")
     batch_size = 128
     trainloader, trainset, testloader, testset = sample()
     trainset, train_prior, indices = subsample(trainset, lamda, class_indices=list(range(len(trainset.classes))))
     valset, trainset = split(trainset)
     testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
-                                             shuffle=False, num_workers=8)
+                                             shuffle=False, num_workers=8, pin_memory=True)
     trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size,
-                                              shuffle=True, num_workers=8)
+                                              shuffle=True, num_workers=8, pin_memory=True)
     valloader = torch.utils.data.DataLoader(valset, batch_size=batch_size,
-                                              shuffle=True, num_workers=8)
+                                              shuffle=True, num_workers=8, pin_memory=True)
 
     show_data_distribution(trainset, keyname="train dataset")
     show_data_distribution(testset, keyname="test dataset")
@@ -390,7 +388,7 @@ for lamda in [0.6]:
     dataiter = iter(trainloader)
     images, labels = dataiter.next()
     device = torch.device('cuda:3')
-    net = _resnet("resnet56", torchvision.models.resnet.Bottleneck, [3, 4, 8, 3], pretrained=False, progress=True, num_classes=10).to(device)# models.resnet32(num_classes=10).to(device)
+    net = models.resnet32(num_classes=10).to(device)
     optimizer = torch.optim.SGD(net.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4, nesterov=True)
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
                                                         milestones=[600, 900, 1000], gamma = 0.1)
@@ -404,5 +402,4 @@ for lamda in [0.6]:
         random.shuffle(l)
         return l
     best_net = loop(writer, trainloader, testloader, valloader, trainset.classes ,net, optimizer, train_prior, [0.1]*10 , 1200, lr_scheduler, max_steps=50)
-    torch.save(best_net.state_dict(), "./logs/resnet56/lr-0.1_gamma-0.98_50steps.pth")
-
+    torch.save(best_net.state_dict(), "./test")
