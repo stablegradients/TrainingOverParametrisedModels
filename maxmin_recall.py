@@ -95,19 +95,19 @@ def feedforward(dataloader, net, device):
     '''
     net.eval()
     output_logs, label_logs = [], []
-
-    for i, data in enumerate(dataloader, 0):
-        # get the inputs; data is a list of [inputs, labels]
-        inputs, labels = data
-        if torch.cuda.is_available():
-            inputs, labels = inputs.to(device), labels.to(device)
-        else:
-            pass
-        labels = labels.cpu().detach().numpy()
-        outputs = torch.argmax(net(inputs), dim=1).cpu().detach().numpy()
-        output_logs.append(outputs)
-        label_logs.append(labels)
-    return (np.concatenate(output_logs, axis=0), np.concatenate(label_logs, axis=0))
+    with torch.no_grad():
+        for i, data in enumerate(dataloader, 0):
+            # get the inputs; data is a list of [inputs, labels]
+            inputs, labels = data
+            if torch.cuda.is_available():
+                inputs, labels = inputs.to(device), labels.to(device)
+            else:
+                pass
+            labels = labels.cpu().detach().numpy()
+            outputs = torch.argmax(net(inputs), dim=1).cpu().detach().numpy()
+            output_logs.append(outputs)
+            label_logs.append(labels)
+        return (np.concatenate(output_logs, axis=0), np.concatenate(label_logs, axis=0))
 
 
 def test(testloader, net, classes, device=torch.device('cuda:3')):
@@ -219,6 +219,8 @@ def parse():
                         help="don't use progress bae")
     parser.add_argument('--savedir', default="./checkpoints/maxminrecall/", type=str,
                         help='directory to output the result')
+    parser.add_argument('--arch', default="resnet", type=str,
+                        help='directory to output the result')
     args = parser.parse_args()
     return args
 
@@ -233,7 +235,7 @@ def main():
     else:
         train_prior = [1.0/len(trainset.classes)] * len(trainset.classes)
 
-    valset, trainset = split(trainset)
+    valset, trainset = split(testset, split_size=0.5)
     testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size,
                                              shuffle=False, num_workers=args.num_workers, pin_memory=True)
     trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size,
@@ -243,12 +245,17 @@ def main():
 
    # get some random training images
     device = torch.device('cuda:' + str(args.gpu_id))
-    net = models.resnet32(num_classes=10).to(device)
+    num_classes=len(trainset.classes)
+    if args.arch == 'resnet':
+        net = models.resnet32(num_classes=num_classes).to(device)
+    else:
+        net = models.WideResNet(depth=28, widen_factor=2, drop_rate=0, num_classes=num_classes).to(device)
     optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.wdecay, nesterov=args.nestrov)
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
                                                         milestones=[600, 900, 1000], gamma = 0.1)
+    lamda_init = [1.0/num_classes] * num_classes
     best_net = loop(trainloader, testloader, valloader, args.vlr, trainset.classes ,net, optimizer,
-                    train_prior, [0.1]*10 , args.epochs, lr_scheduler, max_steps=args.max_steps, device=device)
+                    train_prior, lamda_init, args.epochs, lr_scheduler, max_steps=args.max_steps, device=device)
     os.makedirs(args.savedir, exist_ok=True)
     torch.save(best_net.state_dict(), args.savedir + args.wandb_runid + ".pth")
 

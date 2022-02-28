@@ -130,9 +130,9 @@ def long_tail_test():
     return
 
 
-def split(dataset):
+def split(dataset, split_size=0.2):
     dataset_len = len(dataset)
-    splits = int(0.2 * dataset_len )
+    splits = int(split_size * dataset_len )
     indices = list(range(dataset_len))
     random.shuffle(indices)
     
