@@ -193,7 +193,7 @@ def parse():
                         help='dataset name')
     parser.add_argument('--epochs', default=1200, type=int,
                         help='number of eval steps to run')
-    parser.add_argument('--max-steps', default=50, type=int,
+    parser.add_argument('--max-steps', default=32, type=int,
                         help='number of eval steps to run')
     parser.add_argument('--batch-size', default=128, type=int,
                         help='train batchsize')
@@ -203,6 +203,8 @@ def parse():
                         help='initial learning rate')
     parser.add_argument('--wdecay', default=1e-4, type=float,
                         help='weight decay')
+    parser.add_argument('--bdecay', default=0.9, type=float,
+                        help='bnorm decay')
     parser.add_argument('--nesterov', action='store_true', default=True,
                         help='use nesterov momentum')
     parser.add_argument('--wandb-project', default="CostSensitiveLoss",
@@ -211,7 +213,7 @@ def parse():
                         help='directory to output the result', type=str)
     parser.add_argument('--wandb-runid', default="test",
                         help='directory to output the result', type=str)
-    parser.add_argument('--lt', type=bool, default=False,
+    parser.add_argument('--lt', type=bool, default=True,
                         help="don't use progress bae")
     parser.add_argument('--nestrov', type=bool, default=True,
                         help="don't use progress bae")
@@ -221,6 +223,7 @@ def parse():
                         help='directory to output the result')
     parser.add_argument('--arch', default="resnet", type=str,
                         help='directory to output the result')
+    parser.add_argument('--dual-norm', default=False, type=bool)
     args = parser.parse_args()
     return args
 
@@ -231,11 +234,12 @@ def main():
     wandb.init(project=args.wandb_project, id=args.wandb_runid, entity=args.wandb_entity)
     trainset, testset = sample(args.dataset)
     if args.lt:
+        print("creating lt dataset")
         trainset, train_prior = subsample(trainset, args.imbalance_ratio)
     else:
         train_prior = [1.0/len(trainset.classes)] * len(trainset.classes)
 
-    valset, trainset = split(testset, split_size=0.5)
+    valset, testset = split(testset, split_size=0.5)
     testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size,
                                              shuffle=False, num_workers=args.num_workers, pin_memory=True)
     trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size,
@@ -250,9 +254,24 @@ def main():
         net = models.resnet32(num_classes=num_classes).to(device)
     else:
         net = models.WideResNet(depth=28, widen_factor=2, drop_rate=0, num_classes=num_classes).to(device)
-    optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.wdecay, nesterov=args.nestrov)
+    if args.dual_norm:
+        wd_params = set()
+        bd_params = set()
+        for m in net.modules():
+            if isinstance(m, (nn.Linear, nn.Conv2d)):
+                wd_params.add(m.weight)
+            if isinstance(m, (nn.BatchNorm2d)):
+                bd_params.add(m.bias)
+        opt_list = [{'params': list(wd_params), 'weight_decay': args.wdecay},
+                    {'params': list(bd_params), 'weight_decay': args.bdecay}]
+        optimizer = torch.optim.SGD(opt_list, lr=args.lr, momentum=0.9, nesterov=args.nestrov)
+    
+    else:
+        optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.wdecay, nesterov=args.nestrov)
+    
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
                                                         milestones=[600, 900, 1000], gamma = 0.1)
+
     lamda_init = [1.0/num_classes] * num_classes
     best_net = loop(trainloader, testloader, valloader, args.vlr, trainset.classes ,net, optimizer,
                     train_prior, lamda_init, args.epochs, lr_scheduler, max_steps=args.max_steps, device=device)
