@@ -31,7 +31,7 @@ class LALoss(nn.Module):
         self.adjustment = torch.log(torch.tensor(np.array(prior)).to(self.device))
         self.adjustment.requires_grad = False
     def forward(self, inputs, targets, reduction='mean'):
-        inputs = inputs - self.adjustment
+        inputs = inputs + self.adjustment
         return F.cross_entropy(inputs, targets, reduction=reduction)
 
 
