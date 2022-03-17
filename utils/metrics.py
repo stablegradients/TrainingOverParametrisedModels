@@ -24,6 +24,7 @@ def get_metrics(outputs, labels, classes):
         11. f1 macroa average
 
     '''
+    num_classes = len(classes)
     precision = precision_score(labels, outputs, average=None, zero_division=0)
     precision_avg = precision_score(labels, outputs, average='macro', zero_division=0)
     max_precision = np.max(precision)
@@ -31,11 +32,16 @@ def get_metrics(outputs, labels, classes):
     mean_precision = np.mean(precision)
     
     recall = recall_score(labels, outputs, average=None, zero_division=0)
+    tail_recall = np.mean(recall[int(0.9*num_classes):])
+    head_recall = np.mean(recall[:int(0.9*num_classes)])
+
+    minHT = min(tail_recall, head_recall)
+
     recall_avg = recall_score(labels, outputs, average='macro', zero_division=0)
     max_recall = np.max(recall)
     min_recall = np.min(recall)
     mean_recall = np.mean(recall)
-    
+
     f1_micro = f1_score(labels, outputs, average='micro')
     f1_macro = f1_score(labels, outputs, average='macro')
 
@@ -51,7 +57,10 @@ def get_metrics(outputs, labels, classes):
                 "mean_recall": mean_recall,
                 "min_recall": min_recall,
                 "f1_micro": f1_micro,
-                "f1_macro": f1_macro
+                "f1_macro": f1_macro,
+                "tail_recall": tail_recall,
+                "head_recall": head_recall,
+                "min_head_tail": minHT
                 }
     for i, name in enumerate(classes):
         metrics["precision_" + name] = precision[i]
