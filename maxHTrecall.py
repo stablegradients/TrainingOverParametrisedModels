@@ -22,7 +22,7 @@ import models
 from dataset.longtail import sample, subsample, show_data_distribution, split
 from utils.metrics import get_metrics
 
-from resnet import ResNet, BasicBlock
+from resnet import ResNet, resnet56, BasicBlock
 
 class LALoss(nn.Module):
     def __init__(self, gain_matrix, device):
@@ -139,17 +139,28 @@ def validation( valloader, net, lamda, prior, wandblog={}, val_lr=0.1, device=to
         the gain matrix and lamda
     '''
     net.eval()
+    num_classes = len(prior)
     outputs, labels = feedforward(valloader, net, device)
-    recall = recall_score(labels, outputs, average=None, zero_division=0)
     CM = confusion_matrix(labels, outputs, normalize="all")
-    
-    new_lamdas = [x * np.exp(-1 * val_lr * r) for x, r in zip(lamda, recall.tolist())]
-    new_lamdas = [x/sum(new_lamdas) for x in new_lamdas]
+    recall = recall_score(labels, outputs, average=None, zero_division=0)
+    head_recall = np.mean(recall[:int(0.9 * num_classes)])
+    tail_recall = np.mean(recall[int(0.9 * num_classes):])
+
+    lamda_h, lamda_t = lamda[0], lamda[-1]
+
+    lamda_h = lamda_h * np.exp(-1 * val_lr * head_recall)
+    lamda_t = lamda_t * np.exp(-1 * val_lr * tail_recall)
+
+    lamda_h = lamda_h/(lamda_h + lamda_t)
+    lamda_t = 1 - lamda_h
+
+    new_lamdas_ = [lamda_h/(0.9 * num_classes)] * int(0.9 * num_classes) + [lamda_t/(0.1 * num_classes)] * int(0.1 * num_classes)
+    new_lamdas = [lamda_h] * int(0.9 * num_classes) + [lamda_t] * int(0.1 * num_classes)
 
     for i, l in enumerate(new_lamdas):
         wandblog["val/lambda " + str(i)] = l
-    
-    diagonal = [x/p for x,p in zip(new_lamdas, prior)]
+
+    diagonal = [x/p for x,p in zip(new_lamdas_, prior)]
     G = np.diag(diagonal)
 
     return G, new_lamdas, CM, wandblog
@@ -157,16 +168,26 @@ def validation( valloader, net, lamda, prior, wandblog={}, val_lr=0.1, device=to
 
 def loop(   trainloader, testloader, valloader, val_lr,
             classes, net, optimizer, prior, lamda, epochs=1200, 
-            lr_scheduler=None, max_steps=50, device=torch.device('cuda:3'), step_lr_val=True):
+            lr_scheduler=None, max_steps=50, device=torch.device('cuda:3'), step_lr_val=False, inc_steps=False):
     logbar = tqdm(range(0, epochs), total=epochs, leave=False)
     max_acc = 0.0
     best_acc_model = None
-
     for i in logbar:
         wandblog = {}
+        '''
+        if i== or i==90:
+            for param in optimizer.param_groups:
+                param['weight_decay'] = 0.1
+        else:
+            for param in optimizer.param_groups:
+                param['weight_decay'] = 0.1
+        '''
         if step_lr_val:
             if i in [600, 900, 1000]:
                 val_lr = val_lr * 0.1
+        if inc_steps and i > 600:
+            max_steps = 90
+
         G, lamda, CM, wandblog = validation(valloader=valloader, net=net, lamda=lamda,
                                             prior=prior, wandblog=wandblog, val_lr=val_lr, device=device)
         criterion = LALoss(gain_matrix=G, device=device)
@@ -211,7 +232,7 @@ def parse():
                         help='bnorm decay')
     parser.add_argument('--nesterov', action='store_true', default=True,
                         help='use nesterov momentum')
-    parser.add_argument('--wandb-project', default="TrainingOverParameterisedModels",
+    parser.add_argument('--wandb-project', default="MaxMinHTRecall",
                         help='directory to output the result', type=str)
     parser.add_argument('--wandb-entity', default="stablegradients",
                         help='directory to output the result', type=str)
@@ -228,8 +249,8 @@ def parse():
     parser.add_argument('--arch', default="resnet", type=str,
                         help='directory to output the result')
     parser.add_argument('--dual-norm', default=False, type=bool)
-    parser.add_argument('--train-split', default=False, type=bool)
     parser.add_argument('--step-val', default=False, type=bool)
+    parser.add_argument('--inc-steps', default=False, type=bool)
     args = parser.parse_args()
     return args
 
@@ -244,13 +265,8 @@ def main():
         trainset, train_prior = subsample(trainset, args.imbalance_ratio)
     else:
         train_prior = [1.0/len(trainset.classes)] * len(trainset.classes)
-    if args.train_split:
-        print("Going for a trainset split")
-        valset, trainset = split(trainset, split_size=0.2)
-    else:
-        print("Going for a testset split")
-        valset, testset = split(testset, split_size=0.5)
-    
+
+    valset, testset = split(testset, split_size=0.5)
     testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size,
                                              shuffle=False, num_workers=args.num_workers, pin_memory=True)
     trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size,
@@ -262,7 +278,7 @@ def main():
     device = torch.device('cuda:' + str(args.gpu_id))
     num_classes=len(trainset.classes)
     net = ResNet(BasicBlock, [9, 9, 9], num_classes).to(device)
-    
+
     if args.dual_norm:
         wd_params = set()
         bd_params = set()
@@ -274,15 +290,16 @@ def main():
         opt_list = [{'params': list(wd_params), 'weight_decay': args.wdecay},
                     {'params': list(bd_params), 'weight_decay': args.bdecay}]
         optimizer = torch.optim.SGD(opt_list, lr=args.lr, momentum=0.9, nesterov=args.nestrov)
+    
     else:
-        optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.wdecay, nesterov=args.nestrov)
+        optimizer = torch.optim.Adam(net.parameters(), lr=args.lr)
     
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
                                                         milestones=[600, 900, 1000], gamma = 0.1)
 
     lamda_init = [1.0/num_classes] * num_classes
     best_net = loop(trainloader, testloader, valloader, args.vlr, trainset.classes ,net, optimizer,
-                    train_prior, lamda_init, args.epochs, lr_scheduler, max_steps=args.max_steps, device=device, step_lr_val=args.step_val)
+                    train_prior, lamda_init, args.epochs, lr_scheduler, max_steps=args.max_steps, device=device, step_lr_val=args.step_val, inc_steps=args.inc_steps)
     os.makedirs(args.savedir, exist_ok=True)
     torch.save(best_net.state_dict(), args.savedir + args.wandb_runid + ".pth")
 
