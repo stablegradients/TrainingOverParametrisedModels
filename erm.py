@@ -164,7 +164,7 @@ def parse():
                         help='bnorm decay')
     parser.add_argument('--nesterov', action='store_true', default=True,
                         help='use nesterov momentum')
-    parser.add_argument('--wandb-project', default="TrainingOverParameterisedModels",
+    parser.add_argument('--wandb-project', default="ERMBaselines",
                         help='directory to output the result', type=str)
     parser.add_argument('--wandb-entity', default="stablegradients",
                         help='directory to output the result', type=str)
