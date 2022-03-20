@@ -24,7 +24,7 @@ from utils.metrics import get_metrics
 
 
 
-def train(trainloader, optimizer, net, criterion, epoch, device=torch.device('cuda:3')):
+def train(trainloader, optimizer, net, criterion, epoch, device=torch.device('cuda:3'), separate_decay=False):
     '''
     Trains the model for one epoch
     ARGS:   
@@ -54,6 +54,11 @@ def train(trainloader, optimizer, net, criterion, epoch, device=torch.device('cu
         outputs = net(inputs)
         loss = criterion(outputs, labels)
 
+        if separate_decay:
+            loss_r = 0
+            for parameter in net.parameters():
+                loss_r += torch.sum(parameter ** 2)
+            loss = loss + 1e-4 * loss_r
 
         # zero the parameter gradients
         optimizer.zero_grad()
@@ -105,7 +110,7 @@ def test(testloader, net, classes, device=torch.device('cuda:3')):
 
 
 def loop(   trainloader, testloader, classes, net, optimizer, epochs=1200, 
-            lr_scheduler=None, device=torch.device('cuda:3')):
+            lr_scheduler=None, device=torch.device('cuda:3'), separate_decay=False):
     logbar = tqdm(range(0, epochs), total=epochs, leave=False)
     max_acc = 0.0
     best_acc_model = None
@@ -114,7 +119,7 @@ def loop(   trainloader, testloader, classes, net, optimizer, epochs=1200,
     for i in logbar:
         wandblog = {}
         wandblog = wandblog|train(  trainloader, optimizer, net, criterion,
-                                    epoch=i, device=device)
+                                    epoch=i, device=device, separate_decay=separate_decay)
         lr_scheduler.step()
 
         wandblog = wandblog|test(testloader, net, classes, device)
@@ -128,6 +133,19 @@ def loop(   trainloader, testloader, classes, net, optimizer, epochs=1200,
         wandb.log(wandblog)
     return best_acc_model
 
+def param_group(model, args):
+    param_group_list = [{'params':[], 'weight_decay':args.wdecay},
+                        {'params':[], 'weight_decay':args.bdecay, 'momentum': 0.1}]
+    for m in model.modules():
+        if isinstance(m, nn.Linear):
+            param_group_list[0]['params'].append(m.weight)
+            param_group_list[0]['params'].append(m.bias)
+        elif isinstance(m, nn.Conv2d):
+            param_group_list[0]['params'].append(m.weight)
+        elif isinstance(m, nn.BatchNorm2d):
+            param_group_list[1]['params'].append(m.weight)
+            param_group_list[1]['params'].append(m.bias)    
+    return param_group_list
 
 def parse():
     parser = argparse.ArgumentParser(description='PyTorch FixMatch Training')
@@ -148,7 +166,7 @@ def parse():
                         help='initial learning rate')
     parser.add_argument('--wdecay', default=1e-4, type=float,
                         help='weight decay')
-    parser.add_argument('--bdecay', default=0.9, type=float,
+    parser.add_argument('--bdecay', default=0.0, type=float,
                         help='bnorm decay')
     parser.add_argument('--nesterov', action='store_true', default=True,
                         help='use nesterov momentum')
@@ -160,15 +178,14 @@ def parse():
                         help='directory to output the result', type=str)
     parser.add_argument('--lt', type=bool, default=True,
                         help="don't use progress bae")
-    parser.add_argument('--nestrov', type=bool, default=True,
-                        help="don't use progress bae")
     parser.add_argument('--imbalance-ratio', type=float, default=100.0,
                         help="don't use progress bae")
     parser.add_argument('--savedir', default="./checkpoints/maxminrecall/", type=str,
                         help='directory to output the result')
     parser.add_argument('--arch', default="resnet", type=str,
                         help='directory to output the result')
-    parser.add_argument('--dual-norm', default=False, type=bool)
+    parser.add_argument('--separate-decay', default=False, type=bool)
+    parser.add_argument('--opt-decay', default=False, type=bool)
     args = parser.parse_args()
     return args
 
@@ -196,13 +213,20 @@ def main():
     elif args.arch == 'resnet56':
          net = ResNet([(9, 16, 1), (9, 32, 2), (9, 64, 2)], num_classes).to(device)
 
-    optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.wdecay, nesterov=args.nestrov)
-
-    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                        milestones=[600, 900, 1100], gamma = 0.1)
+    if args.opt_decay:
+        print("using only the opt decay params")
+        optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.wdecay, nesterov=args.nesterov)
+        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
+                                                            milestones=[600, 900, 1100], gamma = 0.1)
+    else:
+        print("using param groups values")
+        param_group_list = param_group(net, args)
+        optimizer = torch.optim.SGD(param_group_list, lr=args.lr, momentum=0.9, nesterov=args.nesterov)
+        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
+                                                            milestones=[600, 900, 1100], gamma = 0.1)
 
     best_net = loop(trainloader, testloader, trainset.classes, net, optimizer,
-                    args.epochs, lr_scheduler, device=device)
+                    args.epochs, lr_scheduler, device=device, separate_decay=args.separate_decay)
     os.makedirs(args.savedir, exist_ok=True)
     torch.save(best_net.state_dict(), args.savedir + args.wandb_runid + ".pth")
 
