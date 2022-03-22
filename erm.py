@@ -195,10 +195,12 @@ def main():
     print(args)
     wandb.init(project=args.wandb_project, id=args.wandb_runid, entity=args.wandb_entity)
     trainset, testset = sample(args.dataset)
+
     print("creating lt dataset")
     trainset, train_prior = subsample(trainset, args.imbalance_ratio)
-    print("ther prior are ...")
-    print(train_prior)
+
+    for class_, prior in zip(trainset.classes, train_prior):
+        print(class_, ": ", round(prior, 4))
 
     testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size,
                                              shuffle=False, num_workers=args.num_workers, pin_memory=True)

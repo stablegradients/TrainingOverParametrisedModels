@@ -89,6 +89,7 @@ def subsample(dataset, imbalance=1.0):
     for i, name in enumerate(dataset.classes):
         num_samples = max(int(lamda**i * len(dataset_class_wise[i])), 1)
         dataset_class_wise[i] = dataset_class_wise[i][:num_samples]
+        print(name, " #samples: ", num_samples)
 
     select_list = []
     for i, name in enumerate(dataset.classes):

@@ -18,11 +18,9 @@ from torch.utils.tensorboard import SummaryWriter
 import torchvision
 import torchvision.transforms as transforms
 
-import models
+from models import ResNet
 from dataset.longtail import sample, subsample, show_data_distribution, split
 from utils.metrics import get_metrics
-
-from resnet import ResNet, BasicBlock
 
 class LALoss(nn.Module):
     def __init__(self, prior, device):
@@ -35,7 +33,8 @@ class LALoss(nn.Module):
         return F.cross_entropy(inputs, targets, reduction=reduction)
 
 
-def train(trainloader, optimizer, net, criterion, epoch, device=torch.device('cuda:3'), max_steps=50):
+
+def train(trainloader, optimizer, net, criterion, epoch, device=torch.device('cuda:3'), separate_decay=False):
     '''
     Trains the model for one epoch
     ARGS:   
@@ -65,15 +64,11 @@ def train(trainloader, optimizer, net, criterion, epoch, device=torch.device('cu
         outputs = net(inputs)
         loss = criterion(outputs, labels)
 
-        '''
-        the following regularization is something Aditya Krishna Menon, the co-author
-        of both Training Overparametrised models with non decomposable objectives 
-        and Logit adjustment for Long tail Learning did in his code for LA
-        '''
-        loss_r = 0
-        for parameter in net.parameters():
-            loss_r += torch.sum(parameter ** 2)
-        loss = loss + 1e-3 * loss_r
+        if separate_decay:
+            loss_r = 0
+            for parameter in net.parameters():
+                loss_r += torch.sum(parameter ** 2)
+            loss = loss + 1e-4 * loss_r
 
         # zero the parameter gradients
         optimizer.zero_grad()
@@ -84,8 +79,6 @@ def train(trainloader, optimizer, net, criterion, epoch, device=torch.device('cu
         # print statistics
         running_loss = (running_loss*i + loss.item())/(i + 1)
         wandblogs["train/running loss"] = running_loss
-        if i> max_steps:
-            return wandblogs
     return wandblogs
 
 
@@ -122,13 +115,12 @@ def test(testloader, net, classes, device=torch.device('cuda:3')):
     returns a dictionary updated with test logs for the epoch
     '''
     predictions, labels = feedforward(testloader, net, device)
-    num_classes = len(classes)
     wandblog = get_metrics(predictions, labels, classes)
     return wandblog
 
 
 def loop(   trainloader, testloader, classes, prior, net, optimizer, epochs=1200, 
-            lr_scheduler=None, max_steps=50, device=torch.device('cuda:3')):
+            lr_scheduler=None, device=torch.device('cuda:3'), separate_decay=False):
     logbar = tqdm(range(0, epochs), total=epochs, leave=False)
     max_acc = 0.0
     best_acc_model = None
@@ -136,7 +128,8 @@ def loop(   trainloader, testloader, classes, prior, net, optimizer, epochs=1200
 
     for i in logbar:
         wandblog = {}
-        wandblog = wandblog|train(trainloader, optimizer, net, criterion, epoch=i, max_steps=max_steps, device=device)
+        wandblog = wandblog|train(  trainloader, optimizer, net, criterion,
+                                    epoch=i, device=device, separate_decay=separate_decay)
         lr_scheduler.step()
 
         wandblog = wandblog|test(testloader, net, classes, device)
@@ -149,6 +142,21 @@ def loop(   trainloader, testloader, classes, prior, net, optimizer, epochs=1200
             best_acc_model = copy.deepcopy(net)
         wandb.log(wandblog)
     return best_acc_model
+
+
+def param_group(model, args):
+    param_group_list = [{'params':[], 'weight_decay':args.wdecay},
+                        {'params':[], 'weight_decay':args.bdecay, 'momentum': 0.1}]
+    for m in model.modules():
+        if isinstance(m, nn.Linear):
+            param_group_list[0]['params'].append(m.weight)
+            param_group_list[0]['params'].append(m.bias)
+        elif isinstance(m, nn.Conv2d):
+            param_group_list[0]['params'].append(m.weight)
+        elif isinstance(m, nn.BatchNorm2d):
+            param_group_list[1]['params'].append(m.weight)
+            param_group_list[1]['params'].append(m.bias)    
+    return param_group_list
 
 
 def parse():
@@ -166,7 +174,7 @@ def parse():
                         help='number of eval steps to run')
     parser.add_argument('--batch-size', default=128, type=int,
                         help='train batchsize')
-    parser.add_argument('--lr', '--learning-rate', default=0.01, type=float,
+    parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
                         help='initial learning rate')
     parser.add_argument('--wdecay', default=1e-4, type=float,
                         help='weight decay')
@@ -182,15 +190,14 @@ def parse():
                         help='directory to output the result', type=str)
     parser.add_argument('--lt', type=bool, default=True,
                         help="don't use progress bae")
-    parser.add_argument('--nestrov', type=bool, default=True,
-                        help="don't use progress bae")
     parser.add_argument('--imbalance-ratio', type=float, default=100.0,
                         help="don't use progress bae")
     parser.add_argument('--savedir', default="./checkpoints/maxminrecall/", type=str,
                         help='directory to output the result')
     parser.add_argument('--arch', default="resnet", type=str,
                         help='directory to output the result')
-    parser.add_argument('--dual-norm', default=False, type=bool)
+    parser.add_argument('--separate-decay', default=False, type=bool)
+    parser.add_argument('--opt-decay', default=False, type=bool)
     args = parser.parse_args()
     return args
 
@@ -202,6 +209,8 @@ def main():
     trainset, testset = sample(args.dataset)
     print("creating lt dataset")
     trainset, train_prior = subsample(trainset, args.imbalance_ratio)
+    print("ther prior are ...")
+    print(train_prior)
 
     testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size,
                                              shuffle=False, num_workers=args.num_workers, pin_memory=True)
@@ -211,27 +220,30 @@ def main():
    # get some random training images
     device = torch.device('cuda:' + str(args.gpu_id))
     num_classes=len(trainset.classes)
-    net = ResNet(BasicBlock, [9, 9, 9], num_classes).to(device)
-    
-    if args.dual_norm:
-        wd_params = set()
-        bd_params = set()
-        for m in net.modules():
-            if isinstance(m, (nn.Linear, nn.Conv2d)):
-                wd_params.add(m.weight)
-            if isinstance(m, (nn.BatchNorm2d)):
-                bd_params.add(m.bias)
-        opt_list = [{'params': list(wd_params), 'weight_decay': args.wdecay},
-                    {'params': list(bd_params), 'weight_decay': args.bdecay}]
-        optimizer = torch.optim.SGD(opt_list, lr=args.lr, momentum=0.9, nesterov=args.nestrov)
-    else:
-        optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.wdecay, nesterov=args.nestrov)
+    if args.arch == 'resnet32':
+        net = ResNet([(5, 16, 1), (5, 32, 2), (5, 64, 2)], num_classes).to(device)
+    elif args.arch == 'resnet56':
+         net = ResNet([(9, 16, 1), (9, 32, 2), (9, 64, 2)], num_classes).to(device)
 
-    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                        milestones=[600, 900, 1000], gamma = 0.1)
+    if args.arch == 'resnet32':
+        net = ResNet([(5, 16, 1), (5, 32, 2), (5, 64, 2)], num_classes).to(device)
+    elif args.arch == 'resnet56':
+         net = ResNet([(9, 16, 1), (9, 32, 2), (9, 64, 2)], num_classes).to(device)
+
+    if args.opt_decay:
+        print("using only the opt decay params")
+        optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.wdecay, nesterov=args.nesterov)
+        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
+                                                            milestones=[600, 900, 1100], gamma = 0.1)
+    else:
+        print("using param groups values")
+        param_group_list = param_group(net, args)
+        optimizer = torch.optim.SGD(param_group_list, lr=args.lr, momentum=0.9, nesterov=args.nesterov)
+        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
+                                                            milestones=[600, 900, 1100], gamma = 0.1)
 
     best_net = loop(trainloader, testloader, trainset.classes, train_prior, net, optimizer,
-                    args.epochs, lr_scheduler, max_steps=args.max_steps, device=device)
+                    args.epochs, lr_scheduler, device=device, separate_decay=args.separate_decay)
     os.makedirs(args.savedir, exist_ok=True)
     torch.save(best_net.state_dict(), args.savedir + args.wandb_runid + ".pth")
 
