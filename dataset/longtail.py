@@ -82,14 +82,12 @@ def subsample(dataset, imbalance=1.0):
     for i, (img, label) in enumerate(dataset):
         dataset_class_wise[label].append(i)
     
-    for i, name in enumerate(dataset.classes):
-        random.shuffle(dataset_class_wise[i])
 
     lamda = math.exp(-1 * math.log(imbalance)/(len(dataset.classes) - 1))
     for i, name in enumerate(dataset.classes):
         num_samples = max(int(lamda**i * len(dataset_class_wise[i])), 1)
         dataset_class_wise[i] = dataset_class_wise[i][:num_samples]
-        print(name, " #samples: ", num_samples)
+        
 
     select_list = []
     for i, name in enumerate(dataset.classes):

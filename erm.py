@@ -188,7 +188,7 @@ def parse():
                         help='directory to output the result')
     parser.add_argument('--separate-decay', default=False, type=bool)
     parser.add_argument('--opt-decay', default=False, type=bool)
-    parser.add_argument('--split', default=False, type=bool)
+    parser.add_argument('--split', default=True, type=bool)
     args = parser.parse_args()
     return args
 
@@ -200,10 +200,12 @@ def main():
     trainset, testset = sample(args.dataset)
 
     print("creating lt dataset")
+
     trainset, train_prior = subsample(trainset, args.imbalance_ratio)
     if args.split:
         print("splitting the trainset")
         trainset, ignore = split(trainset, 0.25)
+        print(len(trainset))
 
     for class_, prior in zip(trainset.classes, train_prior):
         print(class_, ": ", round(prior, 4))
