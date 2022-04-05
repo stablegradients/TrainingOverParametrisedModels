@@ -22,6 +22,8 @@ from models import ResNet
 from dataset.longtail import sample, subsample, show_data_distribution, split
 from utils.metrics import get_metrics
 
+from wrn import build_WideResNet
+
 
 
 def train(trainloader, optimizer, net, criterion, epoch, device=torch.device('cuda:3'), separate_decay=False):
@@ -207,13 +209,20 @@ def main():
     trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size,
                                               shuffle=True, num_workers=args.num_workers, pin_memory=True)
 
-   # get some random training images
+    # get some random training images
     device = torch.device('cuda:' + str(args.gpu_id))
     num_classes=len(trainset.classes)
     if args.arch == 'resnet32':
         net = ResNet([(5, 16, 1), (5, 32, 2), (5, 64, 2)], num_classes).to(device)
     elif args.arch == 'resnet56':
-         net = ResNet([(9, 16, 1), (9, 32, 2), (9, 64, 2)], num_classes).to(device)
+        net = ResNet([(9, 16, 1), (9, 32, 2), (9, 64, 2)], num_classes).to(device)
+    elif args.arch == 'wrn28-2':
+        wrn_builder = build_WideResNet(28, 2, 0.01, 0.1, 0)
+        net = wrn_builder.build(num_classes).to(device)
+    elif args.arch == 'wrn28-8':
+        wrn_builder = build_WideResNet(28, 8, 0.01, 0.1, 0)
+        net = wrn_builder.build(num_classes).to(device)
+
 
     if args.opt_decay:
         print("using only the opt decay params")
