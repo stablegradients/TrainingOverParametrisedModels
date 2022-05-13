@@ -21,6 +21,8 @@ import torchvision.transforms as transforms
 from models import ResNet
 from dataset.longtail import sample, subsample, show_data_distribution, split
 from utils.metrics import get_metrics
+from wrn import build_WideResNet
+
 
 class LALoss(nn.Module):
     def __init__(self, gain_matrix, device):
@@ -202,7 +204,6 @@ def loop(   trainloader, testloader, valloader, val_lr,
     return best_acc_model
 
 
-
 def param_group(model, args):
     param_group_list = [{'params':[], 'weight_decay':args.wdecay},
                         {'params':[], 'weight_decay':args.bdecay, 'momentum': 0.1}]
@@ -216,6 +217,7 @@ def param_group(model, args):
             param_group_list[1]['params'].append(m.weight)
             param_group_list[1]['params'].append(m.bias)    
     return param_group_list
+
 
 def parse():
     parser = argparse.ArgumentParser(description='PyTorch FixMatch Training')
@@ -262,6 +264,8 @@ def parse():
     parser.add_argument('--step-val', default=False, type=bool)
     parser.add_argument('--inc-steps', default=False, type=bool)
     parser.add_argument('--separate-decay', default=False, type=bool)
+    parser.add_argument('--split', default=True, type=bool)
+    parser.add_argument('--split_ratio', default=0.25, type=float)
     args = parser.parse_args()
     return args
 
@@ -271,12 +275,17 @@ def main():
     print(args)
     wandb.init(project=args.wandb_project, id=args.wandb_runid, entity=args.wandb_entity)
     trainset, testset = sample(args.dataset)
-    
+
     print("creating lt dataset")
     trainset, train_prior = subsample(trainset, args.imbalance_ratio)
     for class_, prior in zip(trainset.classes, train_prior):
         print(class_, ": ", round(prior, 4))
-    
+
+    if args.split:
+        print("splitting the trainset")
+        trainset, ignore = split(trainset, args.split_ratio)
+        print(len(trainset))
+
     valset, testset = split(testset, split_size=0.5)
 
     testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size,
@@ -286,29 +295,38 @@ def main():
     valloader = torch.utils.data.DataLoader(valset, batch_size=args.batch_size,
                                               shuffle=True, num_workers=args.num_workers, pin_memory=True)
 
-   # get some random training images
+    # get some random training images
     device = torch.device('cuda:' + str(args.gpu_id))
     num_classes=len(trainset.classes)
-
     if args.arch == 'resnet32':
         net = ResNet([(5, 16, 1), (5, 32, 2), (5, 64, 2)], num_classes).to(device)
     elif args.arch == 'resnet56':
          net = ResNet([(9, 16, 1), (9, 32, 2), (9, 64, 2)], num_classes).to(device)
 
-    if args.opt_decay:
-        print("using only the opt decay params")
-        optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.wdecay, nesterov=args.nesterov)
+    if args.arch == 'resnet32':
+        net = ResNet([(5, 16, 1), (5, 32, 2), (5, 64, 2)], num_classes).to(device)
+    elif args.arch == 'resnet56':
+         net = ResNet([(9, 16, 1), (9, 32, 2), (9, 64, 2)], num_classes).to(device)
+    elif args.arch == 'wrn28-2':
+        wrn_builder = build_WideResNet(28, 2, 0.01, 0.1, 0)
+        net = wrn_builder.build(num_classes).to(device)
+    elif args.arch == 'wrn28-8':
+        wrn_builder = build_WideResNet(28, 8, 0.01, 0.1, 0)
+        net = wrn_builder.build(num_classes).to(device)
+
+    print("using only the opt decay params")
+    optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.wdecay, nesterov=args.nesterov)
+    if "resnet" in args.arch:
         lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                            milestones=[600, 900, 1100], gamma = 0.1)
-    else:
-        print("using param groups values")
-        param_group_list = param_group(net, args)
-        optimizer = torch.optim.SGD(param_group_list, lr=args.lr, momentum=0.9, nesterov=args.nesterov)
-        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                            milestones=[600, 900, 1100], gamma = 0.1)
+                                                        milestones=[600, 900, 1100], gamma = 0.1)
+    elif "wrn" in args.arch:
+        print("cosine scheduler used")
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 1200, eta_min=0, last_epoch=- 1, verbose=False)
+
 
     lamda_init = [1.0/num_classes] * num_classes
-    
+
+
     best_net = loop(trainloader, testloader, valloader, args.vlr, trainset.classes ,net, optimizer,
                     train_prior, lamda_init, args.epochs, lr_scheduler, max_steps=args.max_steps,
                     device=device, step_lr_val=args.step_val, inc_steps=args.inc_steps, separate_decay=args.separate_decay)

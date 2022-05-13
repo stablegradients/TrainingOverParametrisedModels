@@ -189,6 +189,7 @@ def parse():
     parser.add_argument('--separate-decay', default=False, type=bool)
     parser.add_argument('--opt-decay', default=False, type=bool)
     parser.add_argument('--split', default=True, type=bool)
+    parser.add_argument('--split_ratio', default=0.2, type=float)
     args = parser.parse_args()
     return args
 
@@ -200,15 +201,14 @@ def main():
     trainset, testset = sample(args.dataset)
 
     print("creating lt dataset")
-
+    print("this is modified erm")
     trainset, train_prior = subsample(trainset, args.imbalance_ratio)
     if args.split:
         print("splitting the trainset")
-        trainset, ignore = split(trainset, 0.25)
+        trainset, ignore = split(trainset, args.split_ratio)
         print(len(trainset))
 
-    for class_, prior in zip(trainset.classes, train_prior):
-        print(class_, ": ", round(prior, 4))
+
 
     testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size,
                                              shuffle=False, num_workers=args.num_workers, pin_memory=True)

@@ -18,10 +18,10 @@ from torch.utils.tensorboard import SummaryWriter
 import torchvision
 import torchvision.transforms as transforms
 
+from models import ResNet
 from dataset.longtail import sample, subsample, show_data_distribution, split
 from utils.metrics import get_metrics
-
-from models import ResNet
+from wrn import build_WideResNet
 
 
 def gain_matrix(lamdas, CM, prior, lr=0.1):
@@ -105,8 +105,7 @@ def train(  trainloader, optimizer, net, criterion, epoch,
         # print statistics
         running_loss = (running_loss*i + loss.item())/(i + 1)
         wandblogs["train/running loss"] = running_loss
-        if i > max_steps:
-            return wandblogs
+    return wandblogs
 
 
 def feedforward(dataloader, net, device):
@@ -149,7 +148,8 @@ def test(testloader, net, classes, device=torch.device('cuda:3')):
     return wandblog
 
 
-def validation(valloader, net, lamda, prior, wandblog={}, val_lr=0.1, device=torch.device('cuda:3')):
+def validation( valloader, net, lamda, prior,
+                wandblog={}, val_lr=0.1, device=torch.device('cuda:3')):
     '''
     Args:
         valloader: a torch dataloader
@@ -164,7 +164,7 @@ def validation(valloader, net, lamda, prior, wandblog={}, val_lr=0.1, device=tor
     outputs, labels = feedforward(valloader, net, device)
     recall = recall_score(labels, outputs, average=None, zero_division=0)
     CM = confusion_matrix(labels, outputs, normalize="all")
-    
+
     M, D, new_lamdas = gain_matrix(lamda, CM, prior, val_lr)
     for i, l in enumerate(new_lamdas):
         wandblog["val/lambda " + str(i)] = l
@@ -173,7 +173,8 @@ def validation(valloader, net, lamda, prior, wandblog={}, val_lr=0.1, device=tor
 
 def loop(   trainloader, testloader, valloader, val_lr,
             classes, net, optimizer, prior, lamda, epochs=1200, 
-            lr_scheduler=None, max_steps=50, device=torch.device('cuda:3'), separate_decay=False):
+            lr_scheduler=None, max_steps=50, device=torch.device('cuda:3'),
+            separate_decay=False):
     logbar = tqdm(range(0, epochs), total=epochs, leave=False)
     max_acc = 0.0
     best_acc_model = None
@@ -201,6 +202,22 @@ def loop(   trainloader, testloader, valloader, val_lr,
     return best_acc_model
 
 
+def param_group(model, args):
+    param_group_list = [{'params':[], 'weight_decay':args.wdecay},
+                        {'params':[], 'weight_decay':args.bdecay, 'momentum': 0.1}]
+    for m in model.modules():
+        if isinstance(m, nn.Linear):
+            param_group_list[0]['params'].append(m.weight)
+            param_group_list[0]['params'].append(m.bias)
+        elif isinstance(m, nn.Conv2d):
+            param_group_list[0]['params'].append(m.weight)
+        elif isinstance(m, nn.BatchNorm2d):
+            param_group_list[1]['params'].append(m.weight)
+            param_group_list[1]['params'].append(m.bias)    
+    return param_group_list
+
+
+
 def parse():
     parser = argparse.ArgumentParser(description='PyTorch FixMatch Training')
     parser.add_argument('--gpu-id', default='0', type=int,
@@ -222,7 +239,7 @@ def parse():
                         help='initial learning rate')
     parser.add_argument('--wdecay', default=1e-4, type=float,
                         help='weight decay')
-    parser.add_argument('--bdecay', default=0.9, type=float,
+    parser.add_argument('--bdecay', default=0.0, type=float,
                         help='bnorm decay')
     parser.add_argument('--nesterov', action='store_true', default=True,
                         help='use nesterov momentum')
@@ -241,6 +258,8 @@ def parse():
     parser.add_argument('--arch', default="resnet", type=str,
                         help='directory to output the result')
     parser.add_argument('--separate-decay', default=False, type=bool)
+    parser.add_argument('--split', default=True, type=bool)
+    parser.add_argument('--split_ratio', default=0.25, type=float)
     args = parser.parse_args()
     return args
 
@@ -250,12 +269,17 @@ def main():
     print(args)
     wandb.init(project=args.wandb_project, id=args.wandb_runid, entity=args.wandb_entity)
     trainset, testset = sample(args.dataset)
-    if args.lt:
-        print("creating lt dataset")
-        trainset, train_prior = subsample(trainset, args.imbalance_ratio)
-    else:
-        train_prior = [1.0/len(trainset.classes)] * len(trainset.classes)
+    
+    print("creating lt dataset")
+    trainset, train_prior = subsample(trainset, args.imbalance_ratio)
+    for class_, prior in zip(trainset.classes, train_prior):
+        print(class_, ": ", round(prior, 4))
 
+    if args.split:
+        print("splitting the trainset")
+        trainset, ignore = split(trainset, args.split_ratio)
+        print(len(trainset))
+    
     valset, testset = split(testset, split_size=0.5)
     testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size,
                                              shuffle=False, num_workers=args.num_workers, pin_memory=True)
@@ -264,20 +288,32 @@ def main():
     valloader = torch.utils.data.DataLoader(valset, batch_size=args.batch_size,
                                               shuffle=True, num_workers=args.num_workers, pin_memory=True)
 
-   # get some random training images
-    num_classes = len(trainset.classes)
+    # get some random training images
     device = torch.device('cuda:' + str(args.gpu_id))
-    
+    num_classes=len(trainset.classes)
     if args.arch == 'resnet32':
         net = ResNet([(5, 16, 1), (5, 32, 2), (5, 64, 2)], num_classes).to(device)
     elif args.arch == 'resnet56':
          net = ResNet([(9, 16, 1), (9, 32, 2), (9, 64, 2)], num_classes).to(device)
 
-    optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, nesterov=args.nesterov)
+    if args.arch == 'resnet32':
+        net = ResNet([(5, 16, 1), (5, 32, 2), (5, 64, 2)], num_classes).to(device)
+    elif args.arch == 'resnet56':
+         net = ResNet([(9, 16, 1), (9, 32, 2), (9, 64, 2)], num_classes).to(device)
+    elif args.arch == 'wrn28-2':
+        wrn_builder = build_WideResNet(28, 2, 0.01, 0.1, 0)
+        net = wrn_builder.build(num_classes).to(device)
+    elif args.arch == 'wrn28-8':
+        wrn_builder = build_WideResNet(28, 8, 0.01, 0.1, 0)
+        net = wrn_builder.build(num_classes).to(device)
+
+
+    param_group_list = param_group(net, args)
+    optimizer = torch.optim.SGD(param_group_list, lr=args.lr, momentum=0.9, nesterov=args.nesterov)
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                        milestones=[600, 900, 1000], gamma = 0.1)
+                                                        milestones=[600, 900, 1100], gamma = 0.1)
     # this helped in getting the right numbers
-    lamda_init = [0.0] * num_classes
+    lamda_init = [1.0/num_classes] * num_classes
     best_net = loop(trainloader, testloader, valloader, args.vlr, trainset.classes ,net, optimizer,
                     train_prior, lamda_init , args.epochs, lr_scheduler, max_steps=args.max_steps, device=device,
                     separate_decay=args.separate_decay)

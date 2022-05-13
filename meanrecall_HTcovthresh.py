@@ -23,19 +23,53 @@ from dataset.longtail import sample, subsample, show_data_distribution, split
 from utils.metrics import get_metrics
 from wrn import build_WideResNet
 
-class LALoss(nn.Module):
-    def __init__(self, prior, device):
-        super(LALoss, self).__init__()
+
+def gain_matrix(lamdas, CM, prior, lr=0.1):
+    new_lamdas = []
+    num_classes = len(prior)
+    C = np.sum(CM, axis=0).tolist()
+    
+    lamda1, lamda2 = lamdas[0], lamdas[-1]
+    cov_head, cov_tail = np.mean(C[:int(0.9*num_classes)]), np.mean(C[int(0.9*num_classes):])
+    
+    lamda1 -= lr * (cov_head - 0.95/num_classes)
+    lamda2 -= lr * (cov_tail - 0.95/num_classes)
+
+    lamda1 = max(0, lamda1)
+    lamda2 = max(0, lamda2)
+
+    new_lamdas = [lamda1] *  int(0.9 * num_classes) + [lamda2] *  int(0.1 * num_classes)
+    
+    G = np.zeros((num_classes, num_classes))
+    D = np.zeros((num_classes, num_classes))
+    
+    for i in range(num_classes):
+        for j in range(num_classes):
+            if i==j:
+                G[i, i] = (1.0/num_classes)/prior[i] + new_lamdas[j]/int(0.9 * num_classes)
+                D[i, i] = (1.0/num_classes)/prior[i] + new_lamdas[j]/int(0.1 * num_classes)
+            else:
+                G[i, j] = new_lamdas[j]
+    M = np.matmul(G, np.linalg.inv(D))
+    return M, D, new_lamdas
+
+
+class CSLLoss(nn.Module):
+    def __init__(self, M, D, device='cuda:0'):
+        super(CSLLoss, self).__init__()
         self.device = torch.device(device)
-        self.adjustment = torch.log(torch.tensor(np.array(prior)).to(self.device))
-        self.adjustment.requires_grad = False
-    def forward(self, inputs, targets, reduction='mean'):
-        inputs = inputs + self.adjustment
-        return F.cross_entropy(inputs, targets, reduction=reduction)
+        self.M = torch.tensor(M)
+        self.D = torch.tensor(np.diag(D))
+        self.adjustment = torch.log(self.D.to(torch.device(self.device)))
+    def forward(self, inputs, targets):
+        log_probs = F.log_softmax(inputs - self.adjustment , dim=1)
+        weights = self.M[targets.cpu()].to(torch.device(self.device))
+        product = weights * log_probs
+        return -1 * torch.mean(torch.sum(product, 1))
 
 
-
-def train(trainloader, optimizer, net, criterion, epoch, device=torch.device('cuda:3'), separate_decay=False):
+def train(  trainloader, optimizer, net, criterion, epoch,
+            device=torch.device('cuda:3'), separate_decay=False, max_steps=32):
     '''
     Trains the model for one epoch
     ARGS:   
@@ -90,19 +124,19 @@ def feedforward(dataloader, net, device):
     '''
     net.eval()
     output_logs, label_logs = [], []
-    with torch.no_grad():
-        for i, data in enumerate(dataloader, 0):
-            # get the inputs; data is a list of [inputs, labels]
-            inputs, labels = data
-            if torch.cuda.is_available():
-                inputs, labels = inputs.to(device), labels.to(device)
-            else:
-                pass
-            labels = labels.cpu().detach().numpy()
-            outputs = torch.argmax(net(inputs), dim=1).cpu().detach().numpy()
-            output_logs.append(outputs)
-            label_logs.append(labels)
-        return (np.concatenate(output_logs, axis=0), np.concatenate(label_logs, axis=0))
+
+    for i, data in enumerate(dataloader, 0):
+        # get the inputs; data is a list of [inputs, labels]
+        inputs, labels = data
+        if torch.cuda.is_available():
+            inputs, labels = inputs.to(device), labels.to(device)
+        else:
+            pass
+        labels = labels.cpu().detach().numpy()
+        outputs = torch.argmax(net(inputs), dim=1).cpu().detach().numpy()
+        output_logs.append(outputs)
+        label_logs.append(labels)
+    return (np.concatenate(output_logs, axis=0), np.concatenate(label_logs, axis=0))
 
 
 def test(testloader, net, classes, device=torch.device('cuda:3')):
@@ -117,20 +151,52 @@ def test(testloader, net, classes, device=torch.device('cuda:3')):
     '''
     predictions, labels = feedforward(testloader, net, device)
     wandblog = get_metrics(predictions, labels, classes)
+    CM = confusion_matrix(labels, predictions, normalize="all")
+    coverages = np.sum(CM, axis=0)
+    wandblog["minimum coverage"] = np.min(coverages)
     return wandblog
 
 
-def loop(   trainloader, testloader, classes, prior, net, optimizer, epochs=1200, 
-            lr_scheduler=None, device=torch.device('cuda:3'), separate_decay=False):
+def validation( valloader, net, lamda, prior,
+                wandblog={}, val_lr=0.1, device=torch.device('cuda:3')):
+    '''
+    Args:
+        valloader: a torch dataloader
+        net: classifier model
+        lamda: a list of lagrange multiliers float
+        prior: list of float priors.
+        lr: learning rate for ED technique
+    Returns:
+        the gain matrix and lamda
+    '''
+    net.eval()
+    outputs, labels = feedforward(valloader, net, device)
+    recall = recall_score(labels, outputs, average=None, zero_division=0)
+    CM = confusion_matrix(labels, outputs, normalize="all")
+
+    M, D, new_lamdas = gain_matrix(lamda, CM, prior, val_lr)
+    for i, l in enumerate(new_lamdas):
+        wandblog["val/lambda " + str(i)] = l
+    return M, D, new_lamdas, CM, wandblog
+
+
+def loop(   trainloader, testloader, valloader, val_lr,
+            classes, net, optimizer, prior, lamda, epochs=1200, 
+            lr_scheduler=None, max_steps=50, device=torch.device('cuda:3'),
+            separate_decay=False):
     logbar = tqdm(range(0, epochs), total=epochs, leave=False)
     max_acc = 0.0
     best_acc_model = None
-    criterion = LALoss(prior, device)
 
     for i in logbar:
         wandblog = {}
-        wandblog = wandblog|train(  trainloader, optimizer, net, criterion,
-                                    epoch=i, device=device, separate_decay=separate_decay)
+
+        M, D, lamda, CM, wandblog = validation( valloader=valloader, net=net, lamda=lamda,
+                                                prior=prior, wandblog=wandblog, val_lr=val_lr, device=device)
+        criterion = CSLLoss(M, D, device)
+
+        wandblog = wandblog|train(  trainloader, optimizer, net, criterion, epoch=i,
+                                    max_steps=max_steps, device=device, separate_decay=separate_decay)
         lr_scheduler.step()
 
         wandblog = wandblog|test(testloader, net, classes, device)
@@ -160,6 +226,7 @@ def param_group(model, args):
     return param_group_list
 
 
+
 def parse():
     parser = argparse.ArgumentParser(description='PyTorch FixMatch Training')
     parser.add_argument('--gpu-id', default='0', type=int,
@@ -177,30 +244,32 @@ def parse():
                         help='train batchsize')
     parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
                         help='initial learning rate')
+    parser.add_argument('--vlr', '--validation-learning-rate', default=0.1, type=float,
+                        help='initial learning rate')
     parser.add_argument('--wdecay', default=1e-4, type=float,
                         help='weight decay')
-    parser.add_argument('--bdecay', default=0.9, type=float,
+    parser.add_argument('--bdecay', default=0.0, type=float,
                         help='bnorm decay')
     parser.add_argument('--nesterov', action='store_true', default=True,
                         help='use nesterov momentum')
-    parser.add_argument('--wandb-project', default="LALossBaselines",
+    parser.add_argument('--wandb-project', default="CIFAR100MaxMeanRecallHTCoverageThresh",
                         help='directory to output the result', type=str)
     parser.add_argument('--wandb-entity', default="stablegradients",
                         help='directory to output the result', type=str)
-    parser.add_argument('--wandb-runid', default="maxmin_recall",
+    parser.add_argument('--wandb-runid', default="test",
                         help='directory to output the result', type=str)
     parser.add_argument('--lt', type=bool, default=True,
                         help="don't use progress bae")
     parser.add_argument('--imbalance-ratio', type=float, default=100.0,
                         help="don't use progress bae")
-    parser.add_argument('--savedir', default="./checkpoints/maxminrecall/", type=str,
+    parser.add_argument('--savedir', default="./checkpoints/maxmeanrecall/", type=str,
                         help='directory to output the result')
     parser.add_argument('--arch', default="resnet", type=str,
                         help='directory to output the result')
     parser.add_argument('--separate-decay', default=False, type=bool)
-    parser.add_argument('--opt-decay', default=False, type=bool)
     parser.add_argument('--split', default=True, type=bool)
-    parser.add_argument('--split_ratio', default=0.2, type=float)
+    parser.add_argument('--split_ratio', default=0.25, type=float)
+    
     args = parser.parse_args()
     return args
 
@@ -210,23 +279,25 @@ def main():
     print(args)
     wandb.init(project=args.wandb_project, id=args.wandb_runid, entity=args.wandb_entity)
     trainset, testset = sample(args.dataset)
-    
     print("creating lt dataset")
     trainset, train_prior = subsample(trainset, args.imbalance_ratio)
-    print("ther prior are ...")
-    print(train_prior)
+    for class_, prior in zip(trainset.classes, train_prior):
+        print(class_, ": ", round(prior, 4))
 
     if args.split:
         print("splitting the trainset")
         trainset, ignore = split(trainset, args.split_ratio)
         print(len(trainset))
 
+    valset, testset = split(testset, split_size=0.5)
     testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size,
                                              shuffle=False, num_workers=args.num_workers, pin_memory=True)
     trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size,
                                               shuffle=True, num_workers=args.num_workers, pin_memory=True)
+    valloader = torch.utils.data.DataLoader(valset, batch_size=args.batch_size,
+                                              shuffle=True, num_workers=args.num_workers, pin_memory=True)
 
-   # get some random training images
+    # get some random training images
     device = torch.device('cuda:' + str(args.gpu_id))
     num_classes=len(trainset.classes)
     if args.arch == 'resnet32':
@@ -245,29 +316,15 @@ def main():
         wrn_builder = build_WideResNet(28, 8, 0.01, 0.1, 0)
         net = wrn_builder.build(num_classes).to(device)
 
-    if args.opt_decay:
-        print("using only the opt decay params")
-        optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.wdecay, nesterov=args.nesterov)
-        if "resnet" in args.arch:
-            lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                            milestones=[600, 900, 1100], gamma = 0.1)
-        elif "wrn" in args.arch:
-            print("cosine scheduler used")
-            lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 1200, eta_min=0, last_epoch=- 1, verbose=False)
-
-    else:
-        print("using param groups values")
-        param_group_list = param_group(net, args)
-        optimizer = torch.optim.SGD(param_group_list, lr=args.lr, momentum=0.9, nesterov=args.nesterov)
-        if "resnet" in args.arch:
-            lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                            milestones=[600, 900, 1100], gamma = 0.1)
-        elif "wrn" in args.arch:
-            print("cosine scheduler used")
-            lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 1200, eta_min=0, last_epoch=- 1, verbose=False)
-
-    best_net = loop(trainloader, testloader, trainset.classes, train_prior, net, optimizer,
-                    args.epochs, lr_scheduler, device=device, separate_decay=args.separate_decay)
+    param_group_list = param_group(net, args)
+    optimizer = torch.optim.SGD(param_group_list, lr=args.lr, momentum=0.9, nesterov=args.nesterov)
+    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
+                                                        milestones=[600, 900, 1100], gamma = 0.1)
+    # this helped in getting the right numbers
+    lamda_init = [1.0/num_classes] * num_classes
+    best_net = loop(trainloader, testloader, valloader, args.vlr, trainset.classes ,net, optimizer,
+                    train_prior, lamda_init , args.epochs, lr_scheduler, max_steps=args.max_steps, device=device,
+                    separate_decay=args.separate_decay)
     os.makedirs(args.savedir, exist_ok=True)
     torch.save(best_net.state_dict(), args.savedir + args.wandb_runid + ".pth")
 

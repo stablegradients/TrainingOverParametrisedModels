@@ -23,6 +23,10 @@ from utils.metrics import get_metrics
 
 from models import ResNet
 
+from wrn import build_WideResNet
+
+
+
 class LALoss(nn.Module):
     def __init__(self, gain_matrix, device):
         super(LALoss, self).__init__()
@@ -80,8 +84,7 @@ def train(  trainloader, optimizer, net, criterion, epoch,
         # print statistics
         running_loss = (running_loss*i + loss.item())/(i + 1)
         wandblogs["train/running loss"] = running_loss
-        if i > max_steps:
-            return wandblogs
+    return wandblogs
 
 
 def feedforward(dataloader, net, device):
@@ -218,8 +221,24 @@ def parse():
     parser.add_argument('--arch', default="resnet", type=str,
                         help='directory to output the result')
     parser.add_argument('--separate-decay', default=False, type=bool)
+    parser.add_argument('--split', default=True, type=bool)
+    parser.add_argument('--split_ratio', default=0.2, type=float)
     args = parser.parse_args()
     return args
+
+def param_group(model, args):
+    param_group_list = [{'params':[], 'weight_decay':args.wdecay},
+                        {'params':[], 'weight_decay':args.bdecay, 'momentum': 0.1}]
+    for m in model.modules():
+        if isinstance(m, nn.Linear):
+            param_group_list[0]['params'].append(m.weight)
+            param_group_list[0]['params'].append(m.bias)
+        elif isinstance(m, nn.Conv2d):
+            param_group_list[0]['params'].append(m.weight)
+        elif isinstance(m, nn.BatchNorm2d):
+            param_group_list[1]['params'].append(m.weight)
+            param_group_list[1]['params'].append(m.bias)    
+    return param_group_list
 
 
 def main():
@@ -233,6 +252,11 @@ def main():
     else:
         train_prior = [1.0/len(trainset.classes)] * len(trainset.classes)
     
+    if args.split:
+        print("splitting the trainset")
+        trainset, ignore = split(trainset, args.split_ratio)
+        print(len(trainset))
+
     valset, testset = split(testset, split_size=0.5)
     
     testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size,
@@ -242,20 +266,33 @@ def main():
     valloader = torch.utils.data.DataLoader(valset, batch_size=args.batch_size,
                                               shuffle=True, num_workers=args.num_workers, pin_memory=True)
 
-   # get some random training images
+    # get some random training images
     device = torch.device('cuda:' + str(args.gpu_id))
     num_classes=len(trainset.classes)
-
     if args.arch == 'resnet32':
         net = ResNet([(5, 16, 1), (5, 32, 2), (5, 64, 2)], num_classes).to(device)
     elif args.arch == 'resnet56':
          net = ResNet([(9, 16, 1), (9, 32, 2), (9, 64, 2)], num_classes).to(device)
 
+    if args.arch == 'resnet32':
+        net = ResNet([(5, 16, 1), (5, 32, 2), (5, 64, 2)], num_classes).to(device)
+    elif args.arch == 'resnet56':
+         net = ResNet([(9, 16, 1), (9, 32, 2), (9, 64, 2)], num_classes).to(device)
+    elif args.arch == 'wrn28-2':
+        wrn_builder = build_WideResNet(28, 2, 0.01, 0.1, 0)
+        net = wrn_builder.build(num_classes).to(device)
+    elif args.arch == 'wrn28-8':
+        wrn_builder = build_WideResNet(28, 8, 0.01, 0.1, 0)
+        net = wrn_builder.build(num_classes).to(device)
 
+    print("using only the opt decay params")
     optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.wdecay, nesterov=args.nesterov)
-    
-    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                        milestones=[600, 900, 1000], gamma = 0.1)
+    if "resnet" in args.arch:
+        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
+                                                        milestones=[600, 900, 1100], gamma = 0.1)
+    elif "wrn" in args.arch:
+        print("cosine scheduler used")
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 1200, eta_min=0, last_epoch=- 1, verbose=False)
 
     lamda_init = [1.0/num_classes] * num_classes
     print("Init of lambdas to ... ", lamda_init)
