@@ -1,7 +1,10 @@
 import numpy as np
-from sklearn.metrics import precision_score, recall_score, accuracy_score, f1_score
+from sklearn.metrics import precision_score, recall_score, accuracy_score, f1_score, confusion_matrix
+from imblearn.metrics import geometric_mean_score
+from scipy import stats
+from scipy.stats.mstats import gmean
 
-def get_metrics(outputs, labels, classes):
+def get_metrics(outputs, labels, classes, tag="test/"):
     '''
     returns a dictionary of computed metrics
     ARGS
@@ -22,7 +25,10 @@ def get_metrics(outputs, labels, classes):
         9. min recall  across all classes
         10. f1 micro average
         11. f1 macroa average
-
+        12. Head recall
+        13. Tail recall
+        14. Head Coverage
+        15. Tail Coverage
     '''
     num_classes = len(classes)
     precision = precision_score(labels, outputs, average=None, zero_division=0)
@@ -45,6 +51,14 @@ def get_metrics(outputs, labels, classes):
     f1_micro = f1_score(labels, outputs, average='micro')
     f1_macro = f1_score(labels, outputs, average='macro')
 
+    Gmean = gmean(recall)
+    Hmean = stats.hmean(recall)
+
+    CM = confusion_matrix(labels, outputs, normalize="all")
+    coverages = np.sum(CM, axis=0)
+
+    head_coverage, tail_coverage =  np.mean(coverages[:int(0.9*num_classes)]), \
+                                    np.mean(coverages[int(0.9*num_classes):])
     accuracy = accuracy_score(labels, outputs)
     metrics =   {
                 "precision": precision_avg,
@@ -60,10 +74,25 @@ def get_metrics(outputs, labels, classes):
                 "f1_macro": f1_macro,
                 "tail_recall": tail_recall,
                 "head_recall": head_recall,
-                "min_head_tail": minHT
+                "min_head_tail": minHT,
+                "head_coverage": head_coverage,
+                "tail_coverage": tail_coverage,
+                "G-mean": Gmean,
+                "H-mean": Hmean
                 }
+
     for i, name in enumerate(classes):
         metrics["precision_" + name] = precision[i]
         metrics["recall_" + name] = recall[i]
 
-    return metrics
+    for i, name in enumerate(classes):
+        metrics["coverage_" + name] = coverages[i]
+    
+    metrics["min_coverage"] = min(coverages)
+
+    # mutate the keys to add the tag:
+    curr_keys = list(metrics.keys())
+    for key in curr_keys:
+        metrics[tag + key] = metrics[key]
+        del metrics[key]
+    return metrics, CM
