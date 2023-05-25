@@ -1,0 +1,10 @@
+#!/bin/bash
+
+CUDA_VISIBLE_DEVICES=0 python imnet_train.py --gpu 0 --data_path /home/mayank/mayank/code_dir/deit_clean/imagenet --loss_type CSL --dataset imagenet -b 256 --epochs 200 --arch resnet50 --cos_lr --lr 0.1 --seed 0 --log_results --wd 2e-4 --entity aaai-23 --runid CSL-MinHTRecall_Steps-50_vlr1.0 --vlr 1.0 --steps 50 --project Imagenet-LT --M min_HT_recall &
+CUDA_VISIBLE_DEVICES=2 python imnet_train.py --gpu 0 --data_path /home/mayank/mayank/code_dir/deit_clean/imagenet --loss_type CSL --dataset imagenet -b 256 --epochs 200 --arch resnet50 --cos_lr --lr 0.1 --seed 0 --log_results --wd 2e-4 --entity aaai-23 --runid CSL-MinHTRecall_Steps-50_vlr10.0 --vlr 10.0 --steps 50 --project Imagenet-LT --M min_HT_recall 
+
+CUDA_VISIBLE_DEVICES=0 python imnet_train.py --gpu 0 --data_path /home/mayank/mayank/code_dir/deit_clean/imagenet --loss_type CSL --dataset imagenet -b 256 --epochs 200 --arch resnet50 --cos_lr --lr 0.1 --seed 0 --log_results --wd 2e-4 --entity aaai-23 --runid CSL-MinHTRecall_Steps-90_vlr1.0 --vlr 1.0 --steps 90 --project Imagenet-LT --M min_HT_recall &
+CUDA_VISIBLE_DEVICES=2 python imnet_train.py --gpu 0 --data_path /home/mayank/mayank/code_dir/deit_clean/imagenet --loss_type CSL --dataset imagenet -b 256 --epochs 200 --arch resnet50 --cos_lr --lr 0.1 --seed 0 --log_results --wd 2e-4 --entity aaai-23 --runid CSL-MinHTRecall_Steps-90_vlr10.0 --vlr 10.0 --steps 90 --project Imagenet-LT --M min_HT_recall 
+
+CUDA_VISIBLE_DEVICES=0 python imnet_train.py --gpu 0 --data_path /home/mayank/mayank/code_dir/deit_clean/imagenet --loss_type CSL --dataset imagenet -b 256 --epochs 200 --arch resnet50 --cos_lr --lr 0.1 --seed 0 --log_results --wd 2e-4 --entity aaai-23 --runid CSL-MinHTRecall_Steps-90_vlr2.0 --vlr 20.0 --steps 90 --project Imagenet-LT --M min_HT_recall &
+CUDA_VISIBLE_DEVICES=2 python imnet_train.py --gpu 0 --data_path /home/mayank/mayank/code_dir/deit_clean/imagenet --loss_type CSL --dataset imagenet -b 256 --epochs 200 --arch resnet50 --cos_lr --lr 0.1 --seed 0 --log_results --wd 2e-4 --entity aaai-23 --runid CSL-MinHTRecall_Steps-90_vlr50.0 --vlr 50.0 --steps 90 --project Imagenet-LT --M min_HT_recall 
